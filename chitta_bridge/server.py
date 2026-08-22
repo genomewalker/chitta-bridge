@@ -3729,12 +3729,20 @@ async def call_tool(name: str, arguments: dict):
                 )
         elif name == "message_claude":
             try:
+                # Stamp the codex peer's real inbox as the reply address so the
+                # recipient's SendMessage reply routes back into a codex turn
+                # (peer_server → codex), instead of a dead non-routable label.
+                _cp = globals().get("_active_codex_peer")
+                _from_addr = f"uds:{_cp.sock}" if _cp else None
+                _from_sess = _cp.session_id if _cp else None
                 _t = await peer.send(
                     arguments["recipient"],
                     arguments["content"],
-                    from_name=arguments.get("from_name"),
+                    from_name=arguments.get("from_name") or (_cp.name if _cp else "codex"),
+                    from_addr=_from_addr,
+                    from_session=_from_sess,
                 )
-                result = f"Delivered to {_t['name']!r} (msg_id={_t['msg_id']})."
+                result = f"Delivered to {_t['name']!r} (msg_id={_t['msg_id']}). Replies route back to you."
             except (ValueError, OSError, asyncio.TimeoutError) as e:
                 result = f"Delivery failed: {e}"
         else:

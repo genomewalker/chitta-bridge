@@ -82,6 +82,35 @@ from chitta_bridge.orchestrator import *  # noqa: F401,F403
 from chitta_bridge.rooms import *  # noqa: F401,F403
 from chitta_bridge.registry import REGISTRY, register
 from chitta_bridge import peer
+from chitta_bridge import peer_worker as _peer_worker
+
+# name -> subprocess.Popen for per-TUI mailbox peers (codex_peer_register)
+_peer_workers: dict = {}
+
+
+def _spawn_peer_worker(name: str, cwd: str) -> str:
+    import subprocess
+    existing = _peer_workers.get(name)
+    if existing is not None and existing.poll() is None:
+        return f"Peer {name!r} already running (pid {existing.pid})."
+    p = subprocess.Popen(
+        [sys.executable, "-m", "chitta_bridge.peer_worker", "--name", name, "--cwd", cwd],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    _peer_workers[name] = p
+    return f"Registered peer {name!r} (worker pid {p.pid}). It now appears in ListAgents."
+
+
+def _stop_peer_worker(name: str) -> str:
+    p = _peer_workers.pop(name, None)
+    if p is None:
+        return f"No peer worker {name!r} tracked by this daemon."
+    try:
+        p.terminate()
+    except ProcessLookupError:
+        pass
+    return f"Stopped peer {name!r}."
 # Explicit imports so ruff can resolve star-import symbols used in this file
 from chitta_bridge.config import CLAUDE_BIN, CODEX_BIN, DEFAULT_CODEX_MODEL, find_codex
 from chitta_bridge.discovery import _discover_claude_shorthands, _discover_codex_shorthands, _infer_backend, _normalize_participant_shorthands
@@ -1177,8 +1206,51 @@ async def list_tools():
                         "type": "string",
                         "description": "Sender label shown to the recipient (e.g. the codex model/session). Optional.",
                     },
+                    "name": {
+                        "type": "string",
+                        "description": "Your own registered peer name (from codex_peer_register). If set, the reply address is your mailbox so the recipient's reply comes back to you (drain with check_messages).",
+                    },
                 },
                 "required": ["recipient", "content"],
+            }
+        ),
+        Tool(
+            name="codex_peer_register",
+            description=(
+                "Register THIS codex session as a messaging peer so Claude sessions "
+                "see it in ListAgents and can message it. Call once at start. Pair "
+                "with check_messages (to read inbound) and message_claude (pass name=)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Peer name to expose, e.g. 'codex-geodesic'."},
+                    "cwd": {"type": "string", "description": "Working dir shown to peers (default: current)."},
+                },
+                "required": ["name"],
+            }
+        ),
+        Tool(
+            name="check_messages",
+            description=(
+                "Drain your peer mailbox — returns and clears messages Claude "
+                "sessions sent to your registered peer name. Poll this to receive."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Your registered peer name."},
+                },
+                "required": ["name"],
+            }
+        ),
+        Tool(
+            name="codex_peer_stop",
+            description="Unregister a peer mailbox previously created with codex_peer_register.",
+            inputSchema={
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "Peer name to stop."}},
+                "required": ["name"],
             }
         ),
         Tool(
@@ -3729,22 +3801,55 @@ async def call_tool(name: str, arguments: dict):
                 )
         elif name == "message_claude":
             try:
-                # Stamp the codex peer's real inbox as the reply address so the
-                # recipient's SendMessage reply routes back into a codex turn
-                # (peer_server → codex), instead of a dead non-routable label.
-                _cp = globals().get("_active_codex_peer")
-                _from_addr = f"uds:{_cp.sock}" if _cp else None
-                _from_sess = _cp.session_id if _cp else None
+                # Reply address: prefer the caller's own registered peer mailbox
+                # (arguments["name"]) so replies come back to it; else the shared
+                # codex peer; else a non-routable label.
+                _from_addr = _from_sess = _from_nm = None
+                _pname = (arguments.get("name") or "").strip()
+                if _pname:
+                    _psess = peer.resolve_recipient(_pname)  # raises if not registered
+                    _from_addr = f"uds:{_psess['sock']}"
+                    _from_sess = _psess.get("sessionId")
+                    _from_nm = _pname
+                else:
+                    _cp = globals().get("_active_codex_peer")
+                    if _cp:
+                        _from_addr, _from_sess, _from_nm = f"uds:{_cp.sock}", _cp.session_id, _cp.name
                 _t = await peer.send(
                     arguments["recipient"],
                     arguments["content"],
-                    from_name=arguments.get("from_name") or (_cp.name if _cp else "codex"),
+                    from_name=arguments.get("from_name") or _from_nm or "codex",
                     from_addr=_from_addr,
                     from_session=_from_sess,
                 )
-                result = f"Delivered to {_t['name']!r} (msg_id={_t['msg_id']}). Replies route back to you."
+                _rb = " Replies route back to you." if _from_addr else ""
+                result = f"Delivered to {_t['name']!r} (msg_id={_t['msg_id']}).{_rb}"
             except (ValueError, OSError, asyncio.TimeoutError) as e:
                 result = f"Delivery failed: {e}"
+        elif name == "codex_peer_register":
+            result = _spawn_peer_worker(
+                arguments["name"], arguments.get("cwd") or os.getcwd()
+            )
+        elif name == "codex_peer_stop":
+            result = _stop_peer_worker(arguments["name"])
+        elif name == "check_messages":
+            _mp = _peer_worker.mailbox_path(arguments["name"])
+            try:
+                _lines = _mp.read_text().splitlines()
+                _mp.write_text("")  # drain
+            except OSError:
+                _lines = []
+            if not _lines:
+                result = f"No new messages for {arguments['name']!r}."
+            else:
+                _msgs = []
+                for _ln in _lines:
+                    try:
+                        _m = json.loads(_ln)
+                    except ValueError:
+                        continue
+                    _msgs.append(f"— from {_m.get('sender') or _m.get('from')}:\n{_m.get('content')}")
+                result = f"{len(_msgs)} message(s):\n\n" + "\n\n".join(_msgs)
         else:
             result = f"Unknown tool: {name}"
 

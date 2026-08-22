@@ -80,6 +80,7 @@ from chitta_bridge.ingest import *  # noqa: F401,F403
 from chitta_bridge.orchestrator import *  # noqa: F401,F403
 from chitta_bridge.rooms import *  # noqa: F401,F403
 from chitta_bridge.registry import REGISTRY, register
+from chitta_bridge import peer
 # Explicit imports so ruff can resolve star-import symbols used in this file
 from chitta_bridge.config import CLAUDE_BIN, CODEX_BIN, DEFAULT_CODEX_MODEL, find_codex
 from chitta_bridge.discovery import _discover_claude_shorthands, _discover_codex_shorthands, _infer_backend, _normalize_participant_shorthands
@@ -1117,6 +1118,42 @@ async def list_tools():
             name="codex_sessions",
             description="List all Codex sessions",
             inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="list_claude_sessions",
+            description=(
+                "List the live Claude Code sessions reachable via cross-session "
+                "messaging (name, status, cwd). Use to find a recipient for "
+                "message_claude."
+            ),
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="message_claude",
+            description=(
+                "Send a message to a running Claude Code session's inbox — it "
+                "lands mid-turn exactly like a message from a peer Claude "
+                "session. Use this to talk back to the Claude that started this "
+                "run. Get recipient names from list_claude_sessions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "recipient": {
+                        "type": "string",
+                        "description": (
+                            "Target Claude session name (e.g. 'opencode-bridge-1f'), "
+                            "its sessionId, or a 'uds:/path' address."
+                        ),
+                    },
+                    "content": {"type": "string", "description": "Message text to deliver."},
+                    "from_name": {
+                        "type": "string",
+                        "description": "Sender label shown to the recipient (e.g. the codex model/session). Optional.",
+                    },
+                },
+                "required": ["recipient", "content"],
+            }
         ),
         Tool(
             name="codex_switch",
@@ -3655,6 +3692,25 @@ async def call_tool(name: str, arguments: dict):
                 notes=arguments.get("notes", ""),
                 replace=bool(arguments.get("replace", False)),
             )
+        elif name == "list_claude_sessions":
+            _sess = peer.list_sessions()
+            if not _sess:
+                result = "No live Claude sessions with a messaging inbox found."
+            else:
+                result = "Reachable Claude sessions:\n" + "\n".join(
+                    f"  {s['name']!r} — status={s.get('status')} cwd={s.get('cwd')}"
+                    for s in _sess
+                )
+        elif name == "message_claude":
+            try:
+                _t = await peer.send(
+                    arguments["recipient"],
+                    arguments["content"],
+                    from_name=arguments.get("from_name"),
+                )
+                result = f"Delivered to {_t['name']!r} (msg_id={_t['msg_id']})."
+            except (ValueError, OSError, asyncio.TimeoutError) as e:
+                result = f"Delivery failed: {e}"
         else:
             result = f"Unknown tool: {name}"
 

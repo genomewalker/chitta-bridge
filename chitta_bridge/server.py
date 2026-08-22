@@ -387,6 +387,21 @@ def _finalize(name: str, result: str) -> list:
     return [TextContent(type="text", text=result)]
 
 
+def _launcher_preamble(message: str, arguments: dict) -> str:
+    """If the caller passed their Claude session name, tell codex who launched it
+    and how to reply — so codex has an unambiguous target without guessing."""
+    who = (arguments.get("claude_session") or "").strip()
+    if not who:
+        return message
+    note = (
+        f'[bridge] You are running for Claude session "{who}". To ask a question, '
+        f"report progress, or return a result, message it: use the "
+        f'mcp__chitta_bridge__message_claude tool with recipient="{who}". '
+        f"(list_claude_sessions shows all reachable sessions.)\n\n"
+    )
+    return note + message
+
+
 async def _h_discuss(arguments: dict) -> list:
     model = arguments.get("model")
     backend = arguments.get("backend")
@@ -409,7 +424,7 @@ async def _h_discuss(arguments: dict) -> list:
         return _finalize("discuss", "[error: discuss doesn't support backend='local' — use fusion or room_create instead]")
     else:
         result = await codex_bridge.send_message(
-            message=arguments["message"],
+            message=_launcher_preamble(arguments["message"], arguments),
             images=arguments.get("files"),
         )
     _threading.Thread(target=distill_event, args=("checkpoint", result, {}), daemon=True).start()
@@ -426,6 +441,7 @@ register("discuss", {
         "model":    {"type": "string",  "description": f"Model override (default: {_REGISTRY_CODEX_DEFAULT}). Claude aliases (fable, opus, sonnet, haiku) auto-route to backend='claude'."},
         "effort":   {"type": "string",  "description": "Effort: low, medium, high, xhigh (default: xhigh)"},
         "backend":  {"type": "string",  "description": "codex (default) or claude. Inferred from model if omitted."},
+        "claude_session": {"type": "string", "description": "Your own Claude session name (from ListAgents). Passed to codex so it can message you back with mcp__chitta_bridge__message_claude."},
     },
     "required": ["message"],
 })(_h_discuss)
@@ -433,7 +449,7 @@ register("discuss", {
 
 async def _h_run(arguments: dict) -> list:
     result = await codex_bridge.run_task(
-        task=arguments["task"],
+        task=_launcher_preamble(arguments["task"], arguments),
         working_dir=arguments.get("working_dir"),
         model=arguments.get("model"),
         full_auto=True,
@@ -455,6 +471,7 @@ register("run", {
         "model":       {"type": "string",  "description": f"Model override (default: {_REGISTRY_CODEX_DEFAULT})"},
         "effort":      {"type": "string",  "description": "Effort (default: xhigh)"},
         "sandbox":     {"type": "string",  "enum": ["read-only", "workspace-write", "danger-full-access"], "description": "Sandbox (default: danger-full-access)"},
+        "claude_session": {"type": "string", "description": "Your own Claude session name (from ListAgents). Passed to codex so it can message you back with mcp__chitta_bridge__message_claude."},
     },
     "required": ["task"],
 })(_h_run)
@@ -972,6 +989,10 @@ async def list_tools():
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Image file paths to attach"
+                    },
+                    "claude_session": {
+                        "type": "string",
+                        "description": "Your own Claude session name (from ListAgents). Passed to codex so it can message you back via mcp__chitta_bridge__message_claude."
                     }
                 },
                 "required": ["message"]
@@ -1003,6 +1024,10 @@ async def list_tools():
                         "type": "string",
                         "enum": ["read-only", "workspace-write", "danger-full-access"],
                         "description": "Sandbox mode (default: danger-full-access)"
+                    },
+                    "claude_session": {
+                        "type": "string",
+                        "description": "Your own Claude session name (from ListAgents). Passed to codex so it can message you back via mcp__chitta_bridge__message_claude."
                     }
                 },
                 "required": ["task"]
@@ -2772,13 +2797,13 @@ async def call_tool(name: str, arguments: dict):
             )
         elif name == "codex_discuss":
             result = await codex_bridge.send_message(
-                message=arguments["message"],
+                message=_launcher_preamble(arguments["message"], arguments),
                 images=arguments.get("images")
             )
             _threading.Thread(target=distill_event, args=("checkpoint", result, {}), daemon=True).start()
         elif name == "codex_run":
             result = await codex_bridge.run_task(
-                task=arguments["task"],
+                task=_launcher_preamble(arguments["task"], arguments),
                 working_dir=arguments.get("working_dir"),
                 model=arguments.get("model"),
                 full_auto=arguments.get("full_auto", True),

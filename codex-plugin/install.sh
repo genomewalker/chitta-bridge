@@ -72,7 +72,7 @@ EOF
 
     echo ""
     echo "chitta-bridge plugin installed for Codex."
-    echo "Skills: /review, /rescue, /room, /soul"
+    echo "Skills: /review, /rescue, /room, /soul, /message"
     echo "Tools: mcp__chitta_bridge__* (soul memory, rooms, web, codex jobs)"
 }
 

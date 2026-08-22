@@ -242,6 +242,9 @@ class CodexPeer:
             writer.close()
 
     def _log(self, msg: str) -> None:
+        # off by default; set CHITTA_BRIDGE_PEER_DEBUG=1 to trace peer traffic
+        if not os.environ.get("CHITTA_BRIDGE_PEER_DEBUG"):
+            return
         try:
             with open(_runtime_dir() / "codex-peer.log", "a") as f:
                 f.write(f"{time.time():.3f} {msg}\n")

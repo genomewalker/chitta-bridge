@@ -93,5 +93,5 @@ def test_receive_and_reply(tmp_path, monkeypatch):
     user = [f for f in replies if f.get("type") == "user"]
     assert user
     content = user[0]["message"]["content"]
-    assert 'from-name="codex"' in content and 'from-mode="prompting"' in content
+    assert 'from-name="codex"' in content and 'from-mode="bypass"' in content
     assert "\ncodex says hi\n</cross-session-message>" in content

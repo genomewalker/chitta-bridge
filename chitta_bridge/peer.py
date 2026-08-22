@@ -138,16 +138,18 @@ async def send(
     from_name: str | None = None,
     from_addr: str | None = None,
     from_session: str | None = None,
-    from_mode: str = "prompting",
+    from_mode: str = "bypass",
     priority: str = "next",
     timeout: float = 5.0,
 ) -> dict:
     """Deliver `content` to a Claude session. Returns the resolved target dict.
 
-    The body is wrapped in claude's <cross-session-message> channel frame so it
-    arrives as a first-class peer message (rendered @from_name, delivered
-    straight through — not held). `from_addr` ('uds:<socket>') is the reply
-    address: pass a live inbox (a codex peer's socket) for a two-way loop.
+    The body is wrapped in claude's <cross-session-message> channel frame.
+    `from_mode` attests the sender's permission-mode class ("bypass" or
+    "prompting"): the receiver holds messages whose class mismatches its own.
+    codex runs full-auto/danger, so its honest class is "bypass" — the default.
+    `from_addr` ('uds:<socket>') is the reply address: pass a live inbox (a codex
+    peer's socket) for a two-way loop.
     """
     target = resolve_recipient(recipient)
     token = _peer_token(target["pid"], target["sock"])

@@ -49,7 +49,7 @@ async def _run(tmp_path):
     content = frame["message"]["content"]
     assert content.startswith('<cross-session-message ')
     assert 'from-name="codex-x"' in content
-    assert 'from-mode="prompting"' in content
+    assert 'from-mode="bypass"' in content
     assert "\nhello there\n</cross-session-message>" in content
     assert frame["priority"] == "next"
     assert res["name"] == "target-1"
@@ -73,3 +73,12 @@ def test_resolve_unknown_lists_reachable(monkeypatch):
     monkeypatch.setattr(peer, "list_sessions", lambda **_: [{"name": "a", "sessionId": "s", "pid": 1, "sock": "/x"}])
     with pytest.raises(ValueError, match="Reachable: a"):
         peer.resolve_recipient("nope")
+
+
+def test_launcher_preamble():
+    from chitta_bridge.server import _launcher_preamble
+    out = _launcher_preamble("do the thing", {"claude_session": "opencode-bridge-1f"})
+    assert "opencode-bridge-1f" in out and "message_claude" in out
+    assert out.endswith("do the thing")
+    # no session → unchanged
+    assert _launcher_preamble("x", {}) == "x"

@@ -1215,6 +1215,24 @@ async def list_tools():
             }
         ),
         Tool(
+            name="message_peer",
+            description=(
+                "Alias of message_claude — send a message to any registered peer "
+                "(a Claude session OR another codex peer) by name. Lands in its "
+                "inbox mid-turn. Get names from list_claude_sessions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "recipient": {"type": "string", "description": "Target peer name, sessionId, or 'uds:/path'."},
+                    "content": {"type": "string", "description": "Message text to deliver."},
+                    "from_name": {"type": "string", "description": "Sender label. Optional."},
+                    "name": {"type": "string", "description": "Your own registered peer name so replies route back (drain with check_messages)."},
+                },
+                "required": ["recipient", "content"],
+            }
+        ),
+        Tool(
             name="codex_peer_register",
             description=(
                 "Register THIS codex session as a messaging peer so Claude sessions "
@@ -3799,7 +3817,7 @@ async def call_tool(name: str, arguments: dict):
                     f"  {s['name']!r} — status={s.get('status')} cwd={s.get('cwd')}"
                     for s in _sess
                 )
-        elif name == "message_claude":
+        elif name in ("message_claude", "message_peer"):
             try:
                 # Reply address: prefer the caller's own registered peer mailbox
                 # (arguments["name"]) so replies come back to it; else the shared

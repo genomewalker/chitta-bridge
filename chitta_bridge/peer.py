@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -66,6 +67,33 @@ def list_sessions(*, live_only: bool = True) -> list[dict]:
     return out
 
 
+_TAG = "cross-session-message"
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _wrap_content(
+    text: str, from_addr: str | None, from_name: str | None,
+    from_mode: str, from_session: str | None,
+) -> str:
+    """Build claude's <cross-session-message> channel frame so the message is a
+    first-class peer message (renders as @name, delivered straight through)."""
+    attrs = []
+    if from_addr:
+        attrs.append(f'from="{from_addr}"')
+    if from_session and _UUID_RE.match(from_session):
+        attrs.append(f'from-session="{from_session}"')
+    if from_name:
+        name = re.sub(r'["<>\r\n]', "", from_name)[:64]
+        if name:
+            attrs.append(f'from-name="{name}"')
+    if from_mode:
+        attrs.append(f'from-mode="{from_mode}"')
+    # neutralize any literal tag markers in the body (matches claude's escaping)
+    body = text.replace(f"</{_TAG}", f"<\\/{_TAG}").replace(f"<{_TAG}", f"<\\{_TAG}")
+    head = f"<{_TAG}{(' ' + ' '.join(attrs)) if attrs else ''}>"
+    return f"{head}\n{body}\n</{_TAG}>"
+
+
 def _peer_token(pid: int, sock: str) -> str | None:
     h = hashlib.sha256(sock.encode()).hexdigest()
     key = _sessions_dir() / f"{pid}.{h}.key"
@@ -108,13 +136,18 @@ async def send(
     content: str,
     *,
     from_name: str | None = None,
+    from_addr: str | None = None,
+    from_session: str | None = None,
+    from_mode: str = "prompting",
     priority: str = "next",
     timeout: float = 5.0,
 ) -> dict:
     """Deliver `content` to a Claude session. Returns the resolved target dict.
 
-    `from_name` is prepended to the body for attribution (codex has no inbox of
-    its own, so replies come back through the bridge, not SendMessage).
+    The body is wrapped in claude's <cross-session-message> channel frame so it
+    arrives as a first-class peer message (rendered @from_name, delivered
+    straight through — not held). `from_addr` ('uds:<socket>') is the reply
+    address: pass a live inbox (a codex peer's socket) for a two-way loop.
     """
     target = resolve_recipient(recipient)
     token = _peer_token(target["pid"], target["sock"])
@@ -124,14 +157,15 @@ async def send(
             f"(pid {target['pid']}) — cannot authenticate to its inbox"
         )
 
-    body = f"[from {from_name}]\n{content}" if from_name else content
+    addr = from_addr or (f"uds:codex:{from_name}" if from_name else "uds:codex")
+    body = _wrap_content(content, addr, from_name, from_mode, from_session)
     frame = {
         "msgV": 1,
         "msg_id": str(uuid.uuid4()),
         "type": "user",
         "message": {"role": "user", "content": body},
         "priority": priority,
-        "from": f"uds:codex:{from_name}" if from_name else "uds:codex",
+        "from": addr,
     }
     payload = (
         json.dumps({"type": "auth", "token": token}) + "\n"

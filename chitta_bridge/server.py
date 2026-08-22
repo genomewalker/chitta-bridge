@@ -27,6 +27,7 @@ import socket
 import uuid
 import copy as _copy
 import threading as _threading
+import atexit as _atexit
 from datetime import datetime
 from pathlib import Path
 
@@ -5126,6 +5127,25 @@ async def _run_http_mode(mcp_port: int = 7681, dashboard_port: int = 7680) -> No
     )
     await _scheduler.start()
     _self_mod._active_scheduler = _scheduler
+
+    # Register codex as a Claude Code messaging peer so any local Claude session
+    # can SendMessage it (and see it in ListAgents). Inbound messages route to a
+    # dedicated codex session; codex's reply goes back via peer.send.
+    try:
+        from chitta_bridge.peer_server import CodexPeer
+
+        async def _codex_peer_handler(content, from_addr, sender):
+            prefix = f"[from Claude session {sender}]\n" if sender else ""
+            if "peer" not in codex_bridge.sessions:
+                await codex_bridge.start_session("peer")
+            return await codex_bridge.send_message(prefix + content, session_id="peer")
+
+        _codex_peer = await CodexPeer("codex", _codex_peer_handler).start()
+        _self_mod._active_codex_peer = _codex_peer
+        _atexit.register(lambda: _codex_peer._remove_registry())
+        print(f"chitta-bridge: codex peer registered at {_codex_peer.sock}", flush=True)
+    except Exception as _e:
+        print(f"chitta-bridge: codex peer registration failed: {_e}", flush=True)
 
     # Start dashboard and MCP SSE concurrently
     await _start_dashboard(port=dashboard_port)

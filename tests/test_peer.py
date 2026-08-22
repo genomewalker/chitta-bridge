@@ -46,7 +46,11 @@ async def _run(tmp_path):
     frame = json.loads(lines[1])
     assert auth == {"type": "auth", "token": token}
     assert frame["type"] == "user" and frame["msgV"] == 1
-    assert frame["message"] == {"role": "user", "content": "[from codex-x]\nhello there"}
+    content = frame["message"]["content"]
+    assert content.startswith('<cross-session-message ')
+    assert 'from-name="codex-x"' in content
+    assert 'from-mode="prompting"' in content
+    assert "\nhello there\n</cross-session-message>" in content
     assert frame["priority"] == "next"
     assert res["name"] == "target-1"
 

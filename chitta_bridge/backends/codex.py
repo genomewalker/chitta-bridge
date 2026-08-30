@@ -301,21 +301,8 @@ def _migrate_persisted(data: dict, kind: str) -> dict:
     return data
 
 
-def find_codex() -> Optional[Path]:
-    import shutil
-    paths = [
-        Path.home() / ".codex" / "bin" / "codex",
-        Path("/usr/local/bin/codex"),
-        Path("/usr/bin/codex"),
-    ]
-    for p in paths:
-        if p.exists():
-            return p
-    which = shutil.which("codex")
-    if which:
-        return Path(which)
-    return None
-
+# single source of truth: env override -> PATH -> known install dirs (incl ~/.local/bin)
+from chitta_bridge.config import find_codex
 
 CODEX_BIN = find_codex()
 

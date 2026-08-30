@@ -95,26 +95,41 @@ class Config:
             _atomic_write_text(config_path, json.dumps(data, indent=2))
 
 
-def find_codex() -> Optional[Path]:
-    """Find codex binary."""
-    # Check common locations
-    paths = [
-        Path.home() / ".codex" / "bin" / "codex",
-        Path("/usr/local/bin/codex"),
-        Path("/usr/bin/codex"),
-    ]
-    for p in paths:
-        if p.exists():
-            return p
-    # Check PATH
-    which = shutil.which("codex")
+# Fallback install dirs, searched when the CLI is not on the server's PATH.
+# The MCP server is often spawned with a PATH that omits ~/.local/bin, which is
+# where both `claude` and `codex` actually install; shutil.which alone then
+# reports them missing even though they exist and run fine for the user.
+_BIN_DIRS = (
+    Path.home() / ".local" / "bin",
+    Path.home() / ".claude" / "bin",
+    Path("/usr/local/bin"),
+    Path("/usr/bin"),
+)
+
+
+def _find_bin(name: str, env_var: str, extra: tuple = ()) -> Optional[Path]:
+    """Resolve a CLI: explicit env override, then PATH, then known install dirs."""
+    override = os.environ.get(env_var)
+    if override and Path(override).exists():
+        return Path(override)
+    which = shutil.which(name)
     if which:
         return Path(which)
+    for d in (*extra, *_BIN_DIRS):
+        candidate = d / name
+        if candidate.exists():
+            return candidate
     return None
 
 
+def find_codex() -> Optional[Path]:
+    """Find codex binary."""
+    return _find_bin("codex", "CHITTA_BRIDGE_CODEX_BIN", (Path.home() / ".codex" / "bin",))
+
+
 CODEX_BIN = find_codex()
-CLAUDE_BIN = shutil.which("claude")
+_claude_bin = _find_bin("claude", "CHITTA_BRIDGE_CLAUDE_BIN")
+CLAUDE_BIN = str(_claude_bin) if _claude_bin else None
 
 _STARTUP_WARNING_PREFIXES = (
     "WARNING: failed to clean up stale",

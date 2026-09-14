@@ -9,7 +9,15 @@
   "homepage": "https://github.com/genomewalker/chitta-bridge",
   "repository": "https://github.com/genomewalker/chitta-bridge",
   "license": "MIT",
-  "keywords": ["chitta", "memory", "soul", "multi-model", "rooms", "review", "rescue"],
+  "keywords": [
+    "chitta",
+    "memory",
+    "soul",
+    "multi-model",
+    "rooms",
+    "review",
+    "rescue"
+  ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
@@ -18,10 +26,14 @@
     "longDescription": "chitta-bridge gives Codex access to persistent soul memory (recall/remember), multi-model discussion rooms, web search/fetch, adversarial code review, background rescue jobs, and local GPU model orchestration via Ollama.",
     "developerName": "Antonio Fernandez-Guerra",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Read", "Write"],
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
     "websiteURL": "https://github.com/genomewalker/chitta-bridge",
     "defaultPrompt": [
-      "Review my code adversarially — challenge the design decisions",
+      "Review my code adversarially \u2014 challenge the design decisions",
       "Rescue: investigate why the tests are failing",
       "Search my soul memory for what I learned about MAG recovery"
     ]

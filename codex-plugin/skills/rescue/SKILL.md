@@ -1,4 +1,5 @@
 ---
+name: rescue
 description: Delegate a task to a background Codex job with rescue, resume, effort control, and job tracking.
 ---
 

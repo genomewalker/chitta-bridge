@@ -1,4 +1,5 @@
 ---
+name: room
 description: Create multi-model discussion rooms where AI agents debate topics, then optionally execute the design via a Claude Code Workflow.
 ---
 

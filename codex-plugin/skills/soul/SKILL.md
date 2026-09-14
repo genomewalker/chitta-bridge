@@ -1,4 +1,5 @@
 ---
+name: soul
 description: Access persistent soul memory — recall past learnings, store new insights, get smart context for tasks.
 ---
 

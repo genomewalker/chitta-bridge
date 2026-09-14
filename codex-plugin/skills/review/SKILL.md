@@ -1,4 +1,5 @@
 ---
+name: review
 description: Run Codex code review via chitta-bridge. Supports normal and adversarial mode, branch comparison, background execution.
 ---
 

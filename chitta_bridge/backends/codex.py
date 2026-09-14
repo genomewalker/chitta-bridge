@@ -302,7 +302,7 @@ def _migrate_persisted(data: dict, kind: str) -> dict:
 
 
 # single source of truth: env override -> PATH -> known install dirs (incl ~/.local/bin)
-from chitta_bridge.config import find_codex
+from chitta_bridge.config import find_codex  # noqa: E402 — after the sys.path/env setup above
 
 CODEX_BIN = find_codex()
 

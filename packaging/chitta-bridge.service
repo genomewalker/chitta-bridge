@@ -1,0 +1,21 @@
+[Unit]
+Description=chitta-bridge streamable HTTP MCP + peer mailbox
+After=chittad.service
+Wants=chittad.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/kbd606
+# Same interpreter as the operator's unit; -m selects the installed package entrypoint.
+ExecStart=/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/python3 -m chitta_bridge.server --http --port 7681
+Environment=CHITTA_BRIDGE_SHUTDOWN_GRACE_S=5
+# Restart even after a clean external SIGTERM. An explicit systemd stop stays stopped.
+Restart=always
+RestartSec=3
+# Let the bridge drain streams first; bound the entire process group if it wedges.
+TimeoutStopSec=20
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

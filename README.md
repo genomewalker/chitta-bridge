@@ -2,6 +2,25 @@
 
 MCP server for multi-model AI discussions — works with **Claude Code** and **Codex CLI**. Connect to any AI backend: cloud agentic CLIs and local GPU models.
 
+## 0.41.0 — HTTP process resilience
+
+- SIGTERM/SIGINT closes listeners and event streams, stops scheduler/rooms/peers,
+  and gives other requests `CHITTA_BRIDGE_SHUTDOWN_GRACE_S` (default 5 seconds)
+  to drain. A watchdog exits successfully after grace plus 1 second if cleanup
+  stalls; a second signal exits immediately. Discovery and peer records are
+  cleaned on shutdown. One log line reports cumulative shutdown phase timings.
+- Unauthenticated `GET /health` reports liveness; `GET /ready` also requires the
+  MCP lifespan and both listeners. Both return 503 during shutdown. JSON includes
+  `status`, `version`, `uptime_s`, `mcp_sessions`, `rooms_active`, `scheduler`, and
+  `shutting_down`. With stateless MCP, `mcp_sessions` counts active HTTP exchanges
+  and legacy SSE connections; `scheduler` is `running`, `disabled`, or `stopping`.
+  MCP authentication is unchanged.
+- Busy ports evict only verified bridge entrypoints and fail with a clear error
+  after 10 seconds. `--port` is an alias for `--mcp-port`.
+- [Sample user unit](packaging/chitta-bridge.service) restarts on clean exits too.
+  Adapt its interpreter and working directory before copying it. An explicit
+  `systemctl --user stop` still stays stopped.
+
 ## Quick Start
 
 ```bash

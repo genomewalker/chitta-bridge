@@ -24,6 +24,7 @@ import json
 import signal as _signal
 import asyncio
 import socket
+import time as _time
 import uuid
 import copy as _copy
 import threading as _threading
@@ -59,7 +60,7 @@ try:
 except Exception:
     pass
 
-from chitta_bridge import __version__
+from chitta_bridge import __version__ as _package_version
 
 # --- extracted modules (re-exported for backward compat) ---
 # ruff: noqa: F405  -- star-import facade; symbols come from extracted modules
@@ -83,6 +84,24 @@ from chitta_bridge.rooms import *  # noqa: F401,F403
 from chitta_bridge.registry import REGISTRY, register
 from chitta_bridge import peer
 from chitta_bridge import peer_worker as _peer_worker
+
+# Explicit imports so ruff can resolve star-import symbols used in this file
+from chitta_bridge.config import CLAUDE_BIN, CODEX_BIN, DEFAULT_CODEX_MODEL, find_codex
+from chitta_bridge.discovery import _discover_claude_shorthands, _discover_codex_shorthands, _infer_backend, _normalize_participant_shorthands
+from chitta_bridge.symbols import _apply_file_patch, _apply_symbol_delete, _apply_symbol_edit, _apply_symbol_insert_child, _apply_symbol_move, _apply_symbol_patch, _apply_symbol_rename, _apply_symbol_rename_project, _locate_symbol
+from chitta_bridge.code_intel import _cache_get_fresh, _make_handle, _read_outline, _read_range
+from chitta_bridge.ingest import chitta_ingest, _doc_ingest, distill_event
+from chitta_bridge.prompts import _expand_paths
+from chitta_bridge.io_utils import _content_hash
+from chitta_bridge.soul import SoulClient
+from chitta_bridge.backends.codex import CodexBridge
+from chitta_bridge.backends.local import GpuNodeDiscovery, LocalModelBridge
+from chitta_bridge.search.web import WebSearch
+from chitta_bridge.search.browser import BrowserFetch, BrowserStackUnavailable
+from chitta_bridge.search.lit import LitSearch
+from chitta_bridge.reflib import RefLib
+from chitta_bridge.orchestrator import Orchestrator
+from chitta_bridge.rooms import RoomManager, _resolve_preamble, ROOM_PREAMBLES, _ULTRACODE_KEYWORDS
 
 # name -> subprocess.Popen for per-TUI mailbox peers (codex_peer_register)
 _peer_workers: dict = {}
@@ -111,23 +130,7 @@ def _stop_peer_worker(name: str) -> str:
     except ProcessLookupError:
         pass
     return f"Stopped peer {name!r}."
-# Explicit imports so ruff can resolve star-import symbols used in this file
-from chitta_bridge.config import CLAUDE_BIN, CODEX_BIN, DEFAULT_CODEX_MODEL, find_codex
-from chitta_bridge.discovery import _discover_claude_shorthands, _discover_codex_shorthands, _infer_backend, _normalize_participant_shorthands
-from chitta_bridge.symbols import _apply_file_patch, _apply_symbol_delete, _apply_symbol_edit, _apply_symbol_insert_child, _apply_symbol_move, _apply_symbol_patch, _apply_symbol_rename, _apply_symbol_rename_project, _locate_symbol
-from chitta_bridge.code_intel import _cache_get_fresh, _make_handle, _read_outline, _read_range
-from chitta_bridge.ingest import chitta_ingest, _doc_ingest, distill_event
-from chitta_bridge.prompts import _expand_paths
-from chitta_bridge.io_utils import _content_hash
-from chitta_bridge.soul import SoulClient
-from chitta_bridge.backends.codex import CodexBridge
-from chitta_bridge.backends.local import GpuNodeDiscovery, LocalModelBridge
-from chitta_bridge.search.web import WebSearch
-from chitta_bridge.search.browser import BrowserFetch, BrowserStackUnavailable
-from chitta_bridge.search.lit import LitSearch
-from chitta_bridge.reflib import RefLib
-from chitta_bridge.orchestrator import Orchestrator
-from chitta_bridge.rooms import RoomManager, _resolve_preamble, ROOM_PREAMBLES, _ULTRACODE_KEYWORDS
+
 
 
 _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
@@ -143,6 +146,27 @@ _BOUNDARY_RE = re.compile(
     r"|^\s*[}\])]\s*$"
 )
 
+
+
+def _runtime_version() -> str:
+    """Use release metadata in source checkouts as well as installed wheels."""
+    from importlib.metadata import PackageNotFoundError, version
+    project = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    if project.is_file():
+        try:
+            import tomllib
+        except ImportError:  # Python 3.10
+            import tomli as tomllib
+        metadata = tomllib.loads(project.read_text()).get("project", {})
+        if metadata.get("name") == "chitta-bridge":
+            return metadata["version"]
+    try:
+        return version("chitta-bridge")
+    except PackageNotFoundError:
+        return _package_version
+
+
+__version__ = _runtime_version()
 
 
 # MCP Server setup
@@ -4781,7 +4805,7 @@ setTimeout(()=>{
 </html>"""
 
 
-async def _start_dashboard(port: int = 7680) -> None:
+async def _start_dashboard(port: int = 7680, *, lifecycle=None):
     """Serve the rooms dashboard on http://localhost:{port}.
 
     SSE protocol — slim snapshot + incremental deltas:
@@ -4972,6 +4996,8 @@ async def _start_dashboard(port: int = 7680) -> None:
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         })
+        if lifecycle is not None:
+            lifecycle.streams.add(asyncio.current_task())
         await resp.prepare(request)
         await resp.write(
             f"data: {_json.dumps({'type': 'snapshot', 'rooms': _all_slim()})}\n\n".encode())
@@ -4987,6 +5013,8 @@ async def _start_dashboard(port: int = 7680) -> None:
         except Exception:
             pass
         finally:
+            if lifecycle is not None:
+                lifecycle.streams.discard(asyncio.current_task())
             if q in _sse_queues:
                 _sse_queues.remove(q)
         return resp
@@ -5025,7 +5053,7 @@ async def _start_dashboard(port: int = 7680) -> None:
 
     async def _try_bind() -> bool:
         nonlocal runner
-        runner = web.AppRunner(app)
+        runner = web.AppRunner(app, shutdown_timeout=lifecycle.grace if lifecycle else 5)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", port)
         try:
@@ -5046,7 +5074,12 @@ async def _start_dashboard(port: int = 7680) -> None:
         if not await _try_bind():
             return  # still can't bind — give up silently
 
-    asyncio.create_task(_watch_rooms())
+    watcher = asyncio.create_task(_watch_rooms())
+    if lifecycle is not None:
+        lifecycle.dashboard = runner
+        lifecycle.dashboard_watcher = watcher
+        lifecycle.dashboard_up = True
+    return runner
 
 
 def _evict_port(port: int, *, allow_http: bool = True) -> bool:
@@ -5061,7 +5094,8 @@ def _evict_port(port: int, *, allow_http: bool = True) -> bool:
     try:
         pids = [
             int(p) for p in
-            subprocess.run(["fuser", f"{port}/tcp"], capture_output=True, text=True).stdout.split()
+            subprocess.run(["fuser", f"{port}/tcp"], capture_output=True, text=True,
+                           timeout=1).stdout.split()
             if p.strip().isdigit()
         ]
     except Exception:
@@ -5069,15 +5103,12 @@ def _evict_port(port: int, *, allow_http: bool = True) -> bool:
     evicted = False
     for pid in pids:
         try:
-            cmd = open(f"/proc/{pid}/cmdline").read().replace("\x00", " ")
-            # Match this server's own entrypoint, not the bare substring
-            # "chitta" — that would also kill chittad, the chitta CLI, or any
-            # other user tool with "chitta" in its path.
-            if "chitta-bridge" not in cmd and "chitta_bridge" not in cmd:
+            argv = Path(f"/proc/{pid}/cmdline").read_text().rstrip("\x00").split("\x00")
+            if pid == os.getpid() or not _bridge_cmdline(argv):
                 continue
-            if allow_http and "--http" in cmd:
+            if allow_http and "--http" in argv:
                 continue  # never kill the persistent HTTP daemon
-            os.kill(pid, 15)
+            os.kill(pid, _signal.SIGTERM)
             evicted = True
         except Exception:
             pass
@@ -5159,19 +5190,249 @@ def _http_token() -> str:
     return t
 
 
-async def _run_http_mode(mcp_port: int = 7681, dashboard_port: int = 7680) -> None:
-    """Run MCP over SSE (shared persistent server) + dashboard, both evicting stale bridges."""
+def _bridge_cmdline(argv: list[str]) -> bool:
+    """Match an entrypoint, never package names embedded in unrelated arguments."""
+    if not argv:
+        return False
+    if Path(argv[0]).name == "chitta-bridge":
+        return True
+    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(argv[0]).name):
+        return False
+    # The module must be Python's executed module, not an argument to -c/a script.
+    args = argv[1:]
+    while args and args[0] in {"-u", "-B", "-E", "-I", "-s", "-S", "-O", "-OO"}:
+        args = args[1:]
+    return bool(args and (
+        args[:2] == ["-m", "chitta_bridge.server"]
+        or Path(args[0]).name == "chitta-bridge"
+        or (Path(args[0]).name == "server.py" and Path(args[0]).parent.name == "chitta_bridge")
+    ))
+
+
+def _port_busy(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError as exc:
+            import errno
+            if exc.errno == errno.EADDRINUSE:
+                return True
+            raise
+    return False
+
+
+async def _wait_for_port(port: int, label: str) -> None:
+    if not _port_busy(port):
+        return
+    deadline = _time.monotonic() + 10
+    _evict_port(port, allow_http=False)
+    while _port_busy(port):
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"chitta-bridge: {label} port {port} still busy after 10 s; "
+                "only verified chitta_bridge.server/chitta-bridge owners may be terminated"
+            )
+        await asyncio.sleep(min(0.1, remaining))
+
+
+class _HTTPLifecycle:
+    """Own HTTP resources and impose one shutdown deadline, including lifespan."""
+
+    def __init__(self):
+        import math
+        self.grace = float(os.environ.get("CHITTA_BRIDGE_SHUTDOWN_GRACE_S", "5"))
+        if not math.isfinite(self.grace) or self.grace < 0:
+            raise ValueError("CHITTA_BRIDGE_SHUTDOWN_GRACE_S must be finite and nonnegative")
+        self.started_at = _time.monotonic()
+        self.shutting_down = False
+        self.mcp_up = self.dashboard_up = False
+        self.streams = set()
+        self.mcp_requests = set()
+        self.scheduler = self.peer = self.dashboard = self.dashboard_watcher = None
+        self.userver = self.port_file = self.run_task = None
+        self.stop_tasks = set()
+        self.timer = None
+        self.phases = {}
+        self.logged = False
+        self.signalled = False
+
+    def health(self, ready=False):
+        from starlette.responses import JSONResponse
+        available = not self.shutting_down and (
+            not ready or (self.mcp_up and self.dashboard_up
+                          and self.userver is not None and self.userver.started)
+        )
+        active_rooms = {rid for rid, lock in rooms._room_locks.items() if lock.locked()}
+        active_rooms.update(rid for rid, state in _bg_rooms.items() if state.get("status") == "running")
+        return JSONResponse({
+            "status": "ok" if available else ("shutting_down" if self.shutting_down else "starting"),
+            "version": __version__,
+            "uptime_s": round(_time.monotonic() - self.started_at, 3),
+            # Streamable HTTP is stateless: count active exchanges + legacy SSE connections.
+            "mcp_sessions": len(self.mcp_requests),
+            "rooms_active": len(active_rooms),
+            "scheduler": "stopping" if self.shutting_down else (
+                "running" if self.scheduler and self.scheduler._active else "disabled"),
+            "shutting_down": self.shutting_down,
+        }, status_code=200 if available else 503)
+
+    def cleanup(self):
+        # Safe at atexit, on startup failure, and before os._exit. Never remove a
+        # successor's discovery file if it has already taken over the port.
+        if self.port_file is not None:
+            try:
+                if f"pid={os.getpid()}" in self.port_file.read_text().splitlines():
+                    self.port_file.unlink()
+            except OSError:
+                pass
+        if self.peer is not None:
+            self.peer._remove_registry()
+
+    def log_shutdown(self, forced=False):
+        if self.logged:
+            return
+        self.logged = True
+        timings = " ".join(f"{name}={value:.3f}s" for name, value in self.phases.items())
+        print(f"chitta-bridge shutdown: {timings} "
+              f"total={_time.monotonic() - self.stop_at:.3f}s forced={forced}", flush=True)
+
+    def force_exit(self):
+        self.cleanup()
+        self.log_shutdown(forced=True)
+        os._exit(0)
+
+    def on_signal(self):
+        if self.signalled:
+            self.force_exit()
+            return
+        self.signalled = True
+        self.begin_shutdown()
+        # uvicorn bounds request drain only. One extra second bounds lifespan,
+        # asyncio.run's cancellation/executor cleanup, and misbehaving clients.
+        self.timer = _threading.Timer(self.grace + 1, self.force_exit)
+        self.timer.daemon = True
+        self.timer.start()
+        if self.run_task is not None and not (self.userver and self.userver.started):
+            self.run_task.cancel()
+
+    def begin_shutdown(self):
+        if self.shutting_down:
+            return
+        self.shutting_down = True
+        self.stop_at = _time.monotonic()
+        if self.userver is not None:
+            self.userver.should_exit = True
+            for listener in getattr(self.userver, "servers", ()):
+                listener.close()
+        if self.dashboard is not None:
+            for site in self.dashboard.sites:
+                if site._server is not None:
+                    site._server.close()
+        self.phases["accept_stop"] = _time.monotonic() - self.stop_at
+        for name in list(_peer_workers):
+            _stop_peer_worker(name)
+        for state in rooms._bg_tasks.values():
+            proc = state.get("proc")
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+        room_tasks = set(_BG_TASKS)
+        room_tasks.update(t for t in asyncio.all_tasks()
+                          if getattr(t.get_coro(), "__name__", "") == "_run_conductor_bg")
+        for task in room_tasks:
+            task.cancel()
+        if self.dashboard_watcher is not None:
+            self.dashboard_watcher.cancel()
+        for resource in (self.scheduler, self.peer):
+            if resource is not None:
+                self.stop_tasks.add(asyncio.create_task(resource.stop()))
+        if self.dashboard is not None:
+            self.stop_tasks.add(asyncio.create_task(self.dashboard.cleanup()))
+        self.phases["notify"] = _time.monotonic() - self.stop_at
+        for task in tuple(self.streams):
+            task.cancel()
+        self.phases["streams_cancel"] = _time.monotonic() - self.stop_at
+
+    async def finish(self):
+        self.begin_shutdown()
+        self.phases["http_drain"] = _time.monotonic() - self.stop_at
+        if self.stop_tasks:
+            done, pending = await asyncio.wait(
+                self.stop_tasks, timeout=max(0, self.grace - (_time.monotonic() - self.stop_at)))
+            for task in pending:
+                task.cancel()
+            for task in done:
+                if not task.cancelled() and task.exception():
+                    print(f"chitta-bridge cleanup: {task.exception()}", file=sys.stderr)
+        self.cleanup()
+        self.phases["cleanup"] = _time.monotonic() - self.stop_at
+        # main logs after asyncio.run has finished cancelling remaining tasks.
+
+    def close(self):
+        if self.timer is not None:
+            self.timer.cancel()
+        if self.shutting_down:
+            self.log_shutdown()
+
+
+class _HTTPStreams:
+    """Track actual event-stream responses without wrapping ASGI in extra tasks."""
+
+    def __init__(self, app, lifecycle):
+        self.app, self.lifecycle = app, lifecycle
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        state = self.lifecycle
+        task = asyncio.current_task()
+        path = scope.get("path", "")
+        if state.shutting_down and path not in {"/health", "/ready"}:
+            from starlette.responses import PlainTextResponse
+            return await PlainTextResponse("Shutting down", status_code=503)(scope, receive, send)
+
+        ended = False
+
+        async def track_send(message):
+            nonlocal ended
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                ended = True
+            if message["type"] == "http.response.start":
+                headers = dict(message.get("headers", []))
+                if headers.get(b"content-type", b"").startswith(b"text/event-stream"):
+                    state.streams.add(task)
+                    state.mcp_requests.add(task)
+                    if state.shutting_down:
+                        task.cancel()
+                elif path == "/mcp" and message["status"] < 400:
+                    state.mcp_requests.add(task)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, track_send)
+        except asyncio.CancelledError:
+            if not state.shutting_down or task not in state.streams:
+                raise
+            # The transport has unwound its task groups. Finish the HTTP body so
+            # deliberate shutdown is an EOF, not an ASGI error or truncated chunk.
+            if not ended:
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            state.streams.discard(task)
+            state.mcp_requests.discard(task)
+
+
+def _make_http_app(lifecycle, _token):
     import hmac as _hmac
-    import uvicorn
+    from contextlib import asynccontextmanager
     from mcp.server.sse import SseServerTransport
     from starlette.applications import Starlette
     from starlette.routing import Mount, Route
     from starlette.responses import Response, PlainTextResponse
-
-    _token = _http_token()
-    # Propagate token to subprocesses (Codex, OpenCode) so they can connect back
-    # to this bridge's HTTP SSE endpoint without spawning a new stdio bridge.
-    os.environ["CHITTA_BRIDGE_TOKEN"] = _token
 
     def _auth_ok(request) -> bool:
         auth = request.headers.get("authorization", "")
@@ -5211,9 +5472,14 @@ async def _run_http_mode(mcp_port: int = 7681, dashboard_port: int = 7680) -> No
                 return
             await session_manager.handle_request(scope, receive, send)
 
+    @asynccontextmanager
     async def lifespan(app):
         async with session_manager.run():
-            yield
+            lifecycle.mcp_up = True
+            try:
+                yield
+            finally:
+                lifecycle.mcp_up = False
 
     from starlette.requests import Request as _Request
 
@@ -5234,8 +5500,16 @@ async def _run_http_mode(mcp_port: int = 7681, dashboard_port: int = 7680) -> No
                 return
         await sse_transport.handle_post_message(scope, receive, send)
 
+    async def health(request):
+        return lifecycle.health()
+
+    async def ready(request):
+        return lifecycle.health(ready=True)
+
     starlette_app = Starlette(
         routes=[
+            Route("/health", endpoint=health),
+            Route("/ready", endpoint=ready),
             Route("/sse", endpoint=handle_sse),
             Route("/mcp", endpoint=_MCPApp(), methods=["GET", "POST", "DELETE"]),
             Mount("/messages/", app=_messages_guard),
@@ -5243,93 +5517,94 @@ async def _run_http_mode(mcp_port: int = 7681, dashboard_port: int = 7680) -> No
         lifespan=lifespan,
     )
 
-    # Evict stale bridge on MCP port if needed
-    for port, label in ((mcp_port, "MCP"), (dashboard_port, "dashboard")):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        in_use = sock.connect_ex(("127.0.0.1", port)) == 0
-        sock.close()
-        if in_use:
-            if _evict_port(port):
-                await asyncio.sleep(1.5)
+    return _HTTPStreams(starlette_app, lifecycle)
 
-    # Write port file so other tools can discover us (token included for auth).
-    # 0600 from creation — it carries the bearer token.
-    #
-    # Host-scoped, because $HOME is NFS and every node shares it: one http.ports
-    # is last-writer-wins, so a bridge on another node silently overwrites this
-    # one's pid and points any reader at a machine it isn't running on. We bind
-    # 127.0.0.1, so discovery is only ever meaningful per host anyway.
-    port_file = (Path.home() / ".chitta-bridge" /
-                 f"http.ports.{socket.gethostname().split('.')[0]}")
-    _write_private(
-        port_file,
-        f"mcp={mcp_port}\ndashboard={dashboard_port}\npid={os.getpid()}\ntoken={_token}\n",
-    )
 
-    # Start scheduler daemon
-    import chitta_bridge.server as _self_mod
+async def _run_http_mode(mcp_port: int = 7681, dashboard_port: int = 7680,
+                         *, lifecycle=None) -> None:
+    import uvicorn
     from chitta_bridge.scheduler import SchedulerService, JOBS_YAML
-    _scheduler = SchedulerService(
-        jobs_yaml=JOBS_YAML,
-        bridge_tools={
-            "codex_bin": str(CODEX_BIN) if CODEX_BIN else "codex",
-            "claude_bin": str(CLAUDE_BIN) if CLAUDE_BIN else "claude",
-            "room_manager": rooms,
-            "bridge_url": f"http://127.0.0.1:{mcp_port}",
-            "bridge_token": _token,
-        },
-        slack_fn=None,   # wire Slack MCP here when available
-        chitta_fn=SoulClient.remember if SoulClient.is_available() else None,
-    )
-    await _scheduler.start()
-    _self_mod._active_scheduler = _scheduler
 
-    # Register codex as a Claude Code messaging peer so any local Claude session
-    # can SendMessage it (and see it in ListAgents). Inbound messages route to a
-    # dedicated codex session; codex's reply goes back via peer.send.
-    try:
-        from chitta_bridge.peer_server import CodexPeer
-
-        async def _codex_peer_handler(content, from_addr, sender):
-            prefix = f"[from Claude session {sender}]\n" if sender else ""
-            if "peer" not in codex_bridge.sessions:
-                await codex_bridge.start_session("peer")
-            return await codex_bridge.send_message(prefix + content, session_id="peer")
-
-        _codex_peer = await CodexPeer("codex", _codex_peer_handler).start()
-        _self_mod._active_codex_peer = _codex_peer
-        _atexit.register(lambda: _codex_peer._remove_registry())
-        print(f"chitta-bridge: codex peer registered at {_codex_peer.sock}", flush=True)
-    except Exception as _e:
-        print(f"chitta-bridge: codex peer registration failed: {_e}", flush=True)
-
-    # Start dashboard and MCP SSE concurrently
-    await _start_dashboard(port=dashboard_port)
-
-    config = uvicorn.Config(starlette_app, host="127.0.0.1", port=mcp_port,
-                            log_level="warning", access_log=False)
-    userver = uvicorn.Server(config)
-    print(f"chitta-bridge HTTP mode: MCP SSE on :{mcp_port}, dashboard on :{dashboard_port}",
-          flush=True)
-
-    # Use _serve() directly to avoid uvicorn's signal handler installation,
-    # which would exit the process on SIGTERM from unrelated bridge instances.
+    state = lifecycle or _HTTPLifecycle()
     loop = asyncio.get_running_loop()
-    stop = asyncio.Event()
-
-    def _on_signal():
-        userver.should_exit = True
-        stop.set()
-
+    state.run_task = asyncio.current_task()
     for sig in (_signal.SIGTERM, _signal.SIGINT):
-        loop.add_signal_handler(sig, _on_signal)
-
+        loop.add_signal_handler(sig, state.on_signal)
+    _atexit.register(state.cleanup)
     try:
-        await userver._serve()
+        if mcp_port == dashboard_port:
+            raise ValueError("MCP and dashboard ports must differ")
+        for port, label in ((mcp_port, "MCP"), (dashboard_port, "dashboard")):
+            await _wait_for_port(port, label)
+
+        token = _http_token()
+        os.environ["CHITTA_BRIDGE_TOKEN"] = token
+        app = _make_http_app(state, token)
+        # Host-scoped discovery, written only once both listeners are up.
+        state.port_file = (Path.home() / ".chitta-bridge" /
+                           f"http.ports.{socket.gethostname().split('.')[0]}")
+        import chitta_bridge.server as _self_mod
+        state.scheduler = SchedulerService(
+            jobs_yaml=JOBS_YAML,
+            bridge_tools={
+                "codex_bin": str(CODEX_BIN) if CODEX_BIN else "codex",
+                "claude_bin": str(CLAUDE_BIN) if CLAUDE_BIN else "claude",
+                "room_manager": rooms,
+                "bridge_url": f"http://127.0.0.1:{mcp_port}",
+                "bridge_token": token,
+            },
+            slack_fn=None,
+            chitta_fn=SoulClient.remember if SoulClient.is_available() else None,
+        )
+        await state.scheduler.start()
+        _self_mod._active_scheduler = state.scheduler
+        try:
+            from chitta_bridge.peer_server import CodexPeer
+
+            async def _codex_peer_handler(content, from_addr, sender):
+                prefix = f"[from Claude session {sender}]\n" if sender else ""
+                if "peer" not in codex_bridge.sessions:
+                    await codex_bridge.start_session("peer")
+                return await codex_bridge.send_message(prefix + content, session_id="peer")
+
+            state.peer = CodexPeer("codex", _codex_peer_handler)
+            await state.peer.start()
+            _self_mod._active_codex_peer = state.peer
+            print(f"chitta-bridge: codex peer registered at {state.peer.sock}", flush=True)
+        except Exception as exc:
+            print(f"chitta-bridge: codex peer registration failed: {exc}", flush=True)
+
+        await _start_dashboard(port=dashboard_port, lifecycle=state)
+        if not state.dashboard_up:
+            raise RuntimeError(f"chitta-bridge: dashboard port {dashboard_port} unavailable at startup")
+
+        config = uvicorn.Config(app, host="127.0.0.1", port=mcp_port,
+                                timeout_graceful_shutdown=state.grace,
+                                log_level="warning", access_log=False)
+
+        class HTTPServer(uvicorn.Server):
+            async def startup(self, sockets=None):
+                await super().startup(sockets=sockets)
+                if self.started and not state.shutting_down:
+                    _write_private(state.port_file,
+                                   f"mcp={mcp_port}\ndashboard={dashboard_port}\n"
+                                   f"pid={os.getpid()}\ntoken={token}\n")
+                    print(f"chitta-bridge HTTP mode: MCP SSE on :{mcp_port}, "
+                          f"dashboard on :{dashboard_port}", flush=True)
+
+        state.userver = HTTPServer(config)
+        # Own signal handling; uvicorn's capture_signals re-raises SIGTERM.
+        await state.userver._serve()
+    except asyncio.CancelledError:
+        if not state.signalled:
+            raise
     finally:
-        await _scheduler.stop()
-        for sig in (_signal.SIGTERM, _signal.SIGINT):
-            loop.remove_signal_handler(sig)
+        await state.finish()
+        _atexit.unregister(state.cleanup)
+        if lifecycle is None:
+            for sig in (_signal.SIGTERM, _signal.SIGINT):
+                loop.remove_signal_handler(sig)
+            state.close()
 
 
 def main():
@@ -5339,7 +5614,7 @@ def main():
                         help="Single-shot mode: read JSON from stdin, write JSON to stdout")
     parser.add_argument("--http", action="store_true",
                         help="HTTP mode: shared persistent MCP SSE server (no stdio)")
-    parser.add_argument("--mcp-port", type=int, default=7681,
+    parser.add_argument("--mcp-port", "--port", type=int, default=7681,
                         help="MCP SSE port in --http mode (default: 7681)")
     parser.add_argument("--dashboard-port", type=int, default=7680,
                         help="Dashboard port (default: 7680)")
@@ -5350,7 +5625,12 @@ def main():
         return
 
     if args.http:
-        asyncio.run(_run_http_mode(mcp_port=args.mcp_port, dashboard_port=args.dashboard_port))
+        lifecycle = _HTTPLifecycle()
+        try:
+            asyncio.run(_run_http_mode(mcp_port=args.mcp_port, dashboard_port=args.dashboard_port,
+                                       lifecycle=lifecycle))
+        finally:
+            lifecycle.close()
         return
 
     # Stdio mode (default) — one bridge per Claude session

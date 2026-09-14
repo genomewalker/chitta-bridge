@@ -120,7 +120,9 @@ def test_inflight_request_gets_grace_then_cancelled(state):
         task = asyncio.create_task(asyncio.Event().wait())
         userver.server_state.tasks.add(task)
         state.begin_shutdown()
-        assert not task.cancelling()
+        if hasattr(task, "cancelling"):  # Task.cancelling() is 3.11+
+            assert not task.cancelling()
+        assert not task.done()
         await userver.shutdown()
         await asyncio.gather(task, return_exceptions=True)
         assert task.cancelled()

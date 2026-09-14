@@ -16,6 +16,7 @@ Skills (Codex): `/review`, `/rescue`, `/room`, `/soul` — plus all `mcp__chitta
 
 ## Features
 
+- **arXiv search**: `lit_search_arxiv` falls back to the Jina reader proxy when direct access fails (5 s direct timeout, 20 s proxy timeout); set `CHITTA_BRIDGE_ARXIV_VIA_PROXY=1` to skip direct access or `CHITTA_BRIDGE_ARXIV_DIRECT_TIMEOUT_S` to change its timeout.
 - **Multiple backends**: Codex CLI and local GPU models (Ollama/vLLM)
 - **Continuous sessions**: Conversation history persists across messages
 - **Session warmup**: background ping captures session ID — subsequent calls skip cold start

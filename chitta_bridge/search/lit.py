@@ -40,6 +40,9 @@ class LitSearch:
     @classmethod
     def arxiv(cls, query: str, max_results: int = 10,
                sort_by: str = "relevance") -> str:
+        import math
+        import os
+        import urllib.error
         import urllib.parse
         import urllib.request
         import xml.etree.ElementTree as ET
@@ -48,10 +51,36 @@ class LitSearch:
         params = {"search_query": query, "max_results": max_results,
                   "sortBy": sort_by, "sortOrder": "descending"}
         url = "http://export.arxiv.org/api/query?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={"User-Agent": "chitta-bridge/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            body = r.read().decode()
-        root = ET.fromstring(body)
+        paths = []
+        if os.environ.get("CHITTA_BRIDGE_ARXIV_VIA_PROXY") != "1":
+            try:
+                direct_timeout = float(os.environ.get("CHITTA_BRIDGE_ARXIV_DIRECT_TIMEOUT_S", "5"))
+                if not math.isfinite(direct_timeout) or direct_timeout <= 0:
+                    raise ValueError("timeout must be positive and finite")
+            except ValueError:
+                return "arXiv search failed: invalid CHITTA_BRIDGE_ARXIV_DIRECT_TIMEOUT_S"
+            paths.append(("direct", url, direct_timeout))
+        paths.append(("proxy", "https://r.jina.ai/" + url, 20))
+        errors = []
+        for path, fetch_url, timeout in paths:
+            try:
+                req = urllib.request.Request(fetch_url, headers={"User-Agent": "chitta-bridge/1.0"})
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    body = r.read().decode()
+                if path == "proxy":
+                    # Jina's reader adds metadata before the Atom XML body.
+                    start = re.search(r"<\?xml\b|<feed\b", body)
+                    if start is None:
+                        raise ValueError("response contains no Atom XML")
+                    body = body[start.start():]
+                root = ET.fromstring(body)
+                if root.tag != "{http://www.w3.org/2005/Atom}feed":
+                    raise ValueError("response is not an Atom feed")
+                break
+            except (urllib.error.URLError, OSError, ValueError, ET.ParseError) as exc:
+                errors.append(f"{path}: {exc}")
+        else:
+            return "arXiv search failed: " + "; ".join(errors)
         entries = root.findall("atom:entry", ns)
         if not entries:
             return f"No arXiv results for: {query}"

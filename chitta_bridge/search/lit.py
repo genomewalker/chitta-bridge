@@ -80,6 +80,12 @@ class LitSearch:
             except (urllib.error.URLError, OSError, ValueError, ET.ParseError) as exc:
                 errors.append(f"{path}: {exc}")
         else:
+            # Last resort: the arXiv HTML search page through the reader proxy.
+            # export.arxiv.org is blocked for the proxy's browser too (HTTP 422),
+            # but arxiv.org/search renders and lists ids, titles and dates.
+            html = cls._arxiv_html_search(query, max_results, errors)
+            if html is not None:
+                return html
             return "arXiv search failed: " + "; ".join(errors)
         entries = root.findall("atom:entry", ns)
         if not entries:
@@ -96,6 +102,57 @@ class LitSearch:
                 f"  Authors: {', '.join(authors)}\n"
                 f"  Published: {published}\n"
                 f"  Abstract: {summary}...\n"
+                f"  URL: https://arxiv.org/abs/{arxiv_id}\n"
+            )
+        return "\n".join(lines)
+
+    @classmethod
+    def _arxiv_html_search(cls, query: str, max_results: int, errors: list) -> str | None:
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        words = re.sub(r"\b(all|ti|abs|au|cat):|\bAND\b|\bOR\b|[\"()]|submittedDate:\[[^\]]*\]", " ", query)
+        words = " ".join(words.split())
+        if not words:
+            errors.append("html: query has no searchable words")
+            return None
+        search = "https://arxiv.org/search/?" + urllib.parse.urlencode(
+            {"query": words, "searchtype": "all", "order": "-announced_date_first",
+             "size": max(25, min(200, max_results))}, quote_via=urllib.parse.quote)
+        try:
+            req = urllib.request.Request("https://r.jina.ai/" + search,
+                                         headers={"User-Agent": "chitta-bridge/1.0"})
+            with urllib.request.urlopen(req, timeout=40) as r:
+                text = r.read().decode(errors="replace")
+        except (urllib.error.URLError, OSError) as exc:
+            errors.append(f"html: {exc}")
+            return None
+        # The reader renders each hit as "arXiv:ID" (in a link) followed by the
+        # title line; dates appear as "Submitted <day month year>".
+        hits = []
+        for m in re.finditer(r"arXiv:(\d{4}\.\d{4,5})(?:v\d+)?", text):
+            arxiv_id = m.group(1)
+            if any(h[0] == arxiv_id for h in hits):
+                continue
+            tail = text[m.end():m.end() + 1500]
+            title = ""
+            for line in tail.splitlines():
+                line = re.sub(r"\[|\]\([^)]*\)|[#*]+", "", line).strip()
+                if len(line) > 12 and not line.lower().startswith(("arxiv", "http", "pdf", "other", "submitted", "authors")):
+                    title = line
+                    break
+            date = re.search(r"Submitted\s+(\d{1,2}\s+\w+,?\s+\d{4})", tail)
+            hits.append((arxiv_id, title, date.group(1) if date else ""))
+            if len(hits) >= max_results:
+                break
+        if not hits:
+            errors.append("html: no arXiv ids in the rendered search page")
+            return None
+        lines = [f"arXiv search: {query!r} — {len(hits)} results (html search page via proxy)\n"]
+        for arxiv_id, title, date in hits:
+            lines.append(
+                f"[{arxiv_id}] {title}\n"
+                f"  Published: {date}\n"
                 f"  URL: https://arxiv.org/abs/{arxiv_id}\n"
             )
         return "\n".join(lines)

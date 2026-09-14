@@ -49,6 +49,9 @@ def stub_urlopen(monkeypatch):
     def urlopen(request, timeout):
         calls.append((request.full_url, timeout))
         assert request.get_header('User-agent') == 'chitta-bridge/1.0'
+        if not responses and 'arxiv.org/search/' in request.full_url:
+            # The last-resort HTML search page is also unreachable in these cases.
+            raise urllib.error.URLError('blocked')
         assert responses, 'unexpected network attempt'
         response = responses.pop(0)
         if isinstance(response, Exception):
@@ -82,8 +85,9 @@ def test_arxiv_both_fail(stub_urlopen):
     result = LitSearch.arxiv(QUERY, max_results=2)
     assert result == (
         'arXiv search failed: direct: <urlopen error direct unavailable>; proxy: proxy timed out'
+        '; html: <urlopen error blocked>'
     )
-    assert calls == [(DIRECT_URL, 5), (PROXY_URL, 20)]
+    assert calls[:2] == [(DIRECT_URL, 5), (PROXY_URL, 20)]
 
 
 def test_arxiv_proxy_only(stub_urlopen, monkeypatch):
@@ -100,9 +104,9 @@ def test_arxiv_proxy_only_failure(stub_urlopen, monkeypatch):
     monkeypatch.setenv('CHITTA_BRIDGE_ARXIV_VIA_PROXY', '1')
     responses.append(urllib.error.URLError('proxy unavailable'))
     assert LitSearch.arxiv(QUERY, max_results=2) == (
-        'arXiv search failed: proxy: <urlopen error proxy unavailable>'
+        'arXiv search failed: proxy: <urlopen error proxy unavailable>; html: <urlopen error blocked>'
     )
-    assert calls == [(PROXY_URL, 20)]
+    assert calls[:1] == [(PROXY_URL, 20)]
 
 
 def test_arxiv_direct_timeout_override(stub_urlopen, monkeypatch):
@@ -136,3 +140,40 @@ def test_arxiv_no_results(stub_urlopen):
     _, responses = stub_urlopen
     responses.extend([TimeoutError('timed out'), PREFIX + '<feed xmlns="http://www.w3.org/2005/Atom"/>'])
     assert LitSearch.arxiv(QUERY) == f'No arXiv results for: {QUERY}'
+
+
+def test_arxiv_html_search_fallback_parses_ids_and_titles(monkeypatch):
+    """When the API is unreachable on every path, the rendered arxiv.org/search page (via the reader proxy) supplies ids and titles."""
+    import urllib.error
+    from chitta_bridge.search.lit import LitSearch
+
+    rendered = (
+        "Title: Search | arXiv e-print repository\n\nMarkdown Content:\n"
+        "1. [arXiv:2609.12354](https://arxiv.org/abs/2609.12354) [pdf](https://arxiv.org/pdf/2609.12354)\n"
+        "CueMem: Cue-Guided Context Reconstruction for Long-Term Conversational Memory\n"
+        "Authors: A. Author\nSubmitted 12 September, 2026;\n\n"
+        "2. [arXiv:2609.12320](https://arxiv.org/abs/2609.12320)\n"
+        "AIM: A Privacy-Aware Interoperable Memory Framework\n"
+    )
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body.encode()
+        def read(self):
+            return self._body
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, timeout=0):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "arxiv.org/search/" in url:
+            return _Resp(rendered)
+        raise urllib.error.URLError("blocked")
+
+    monkeypatch.setenv("CHITTA_BRIDGE_ARXIV_VIA_PROXY", "1")
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    out = LitSearch.arxiv('all:"memory" AND all:"agents"', max_results=2)
+    assert "[2609.12354] CueMem" in out and "[2609.12320] AIM" in out
+    assert "html search page via proxy" in out and "URL: https://arxiv.org/abs/2609.12320" in out
